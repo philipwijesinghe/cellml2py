@@ -34,13 +34,13 @@ class OverrideSpec:
     kind:
         How the override value is applied:
 
-        * ``"algebraic"`` – replace the computed algebraic value entirely.
-        * ``"constant"``  – replace the parameter/constant value.
-        * ``"rate"``      – replace the computed ODE rate (d/dt).
-        * ``"rate_addend"`` – add the forcing value to the computed rate,
+        * ``"algebraic"`` - replace the computed algebraic value entirely.
+        * ``"constant"``  - replace the parameter/constant value.
+        * ``"rate"``      - replace the computed ODE rate (d/dt).
+        * ``"rate_addend"`` - add the forcing value to the computed rate,
           e.g. for injecting a stimulus current without replacing the full
           channel model.
-        * ``None`` – kind is inferred automatically during compilation.
+        * ``None`` - kind is inferred automatically during compilation.
     """
 
     target: str

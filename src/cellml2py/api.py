@@ -2,11 +2,11 @@
 
 This module exposes three user-facing functions:
 
-* :func:`compile_cellml` – compile a raw CellML 1.0 / 1.1 file via the
+* :func:`compile_cellml` - compile a raw CellML 1.0 / 1.1 file via the
   built-in XML parser and MathML translator.
-* :func:`compile_opencor_python` – compile a Python file exported by the
+* :func:`compile_opencor_python` - compile a Python file exported by the
   OpenCOR simulation environment.
-* :func:`simulate` – integrate a compiled model with ``scipy.integrate.solve_ivp``.
+* :func:`simulate` - integrate a compiled model with ``scipy.integrate.solve_ivp``.
 
 Both compiler paths return an identical :class:`~cellml2py.contracts.CompiledModel`
 so that downstream code is agnostic to the source format.
@@ -251,7 +251,7 @@ def simulate_diffrax(
     """
     try:
         import diffrax  # type: ignore
-        import jax # type: ignore
+        import jax  # type: ignore
         import jax.numpy as jnp  # type: ignore
     except ImportError as exc:
         raise ImportError(
