@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellml2py"
+version = "0.1.0"
+description = "Compile CellML and OpenCOR-exported models into RHS callables"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "cellml2py contributors" }]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+examples = [
+  "matplotlib>=3.8",
+  "jupyter>=1.0",
+  "ipykernel>=6.0",
+]
+jax = [
+  "jax>=0.4.20",
+  "jaxlib>=0.4.20",
+  "diffrax>=0.4",
+]
+dev = [
+  "pytest>=8.0",
+  "cellml2py[examples]",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
