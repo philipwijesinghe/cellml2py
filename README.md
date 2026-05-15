@@ -1,8 +1,11 @@
 # cellml2py
 
-> **Experimental.** This project was written for a specific use case, is
-> not well supported, and was written with AI assistance.
-> Expect rough edges and breaking bugs. Work in progress.
+***Convert CellML models to a python callable r.h.s. function that computes rates of the ODE
+for use with your favourite solver.***
+
+> **Experimental.** This project was written for a specific use case.
+> The use case worked, but the rest is not well supported and massaged into place with AI assistance.
+> Expect rough edges and breaking bugs. 
 > Contributions and changes are welcome.
 
 The CellML standard hosts a large collection of biophisical dynamic models that
