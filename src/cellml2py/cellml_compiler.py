@@ -120,7 +120,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType
-from typing import Callable
+from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -343,6 +343,9 @@ class _CellMLModelCompiler:
         self.algebraic_topo_order: list[str] = []
         self.rate_exprs: dict[str, str] = {}
         self.rate_codes: dict[str, CodeType] = {}
+        self.rush_larsen_gates: dict[str, tuple[str, str]] = {}  # root -> (yinf_expr, tau_expr)
+        self.rl_inf_codes: dict[str, CodeType] = {}
+        self.rl_tau_codes: dict[str, CodeType] = {}
         self._equation_kind_by_exact: dict[str, str] = {}
         self.time_roots: set[str] = set()
         self._short_to_roots: dict[str, set[str]] = {}
@@ -1052,6 +1055,13 @@ class _CellMLModelCompiler:
             except SyntaxError:
                 pass
         self._build_algebraic_topo_order()
+        self._detect_rush_larsen_gates()
+        for root, (yinf_expr, tau_expr) in list(self.rush_larsen_gates.items()):
+            try:
+                self.rl_inf_codes[root] = compile(yinf_expr, f"<rl_inf:{root}>", "eval")
+                self.rl_tau_codes[root] = compile(tau_expr, f"<rl_tau:{root}>", "eval")
+            except SyntaxError:
+                del self.rush_larsen_gates[root]
 
     def _build_algebraic_topo_order(self) -> None:
         """Topologically sort algebraic variables so each is evaluated after its deps."""
@@ -1084,6 +1094,119 @@ class _CellMLModelCompiler:
             _dfs(root)
 
         self.algebraic_topo_order = order
+
+    def _detect_rush_larsen_gates(self) -> None:
+        """Detect rate equations of the form ``(y_inf - y) / tau``.
+
+        Populates ``rush_larsen_gates`` with entries ``{root: (yinf_expr,
+        tau_expr)}`` for every state variable whose rate expression matches the
+        standard HH relaxation pattern.  Variables that reference themselves in
+        their own ``y_inf`` or ``tau`` expressions are excluded.
+        """
+        for root, expr in self.rate_exprs.items():
+            result = self._try_parse_rl_expr(expr, root)
+            if result is not None:
+                self.rush_larsen_gates[root] = result
+
+    @staticmethod
+    def _try_parse_rl_expr(expr: str, root: str) -> tuple[str, str] | None:
+        """Return ``(yinf_expr, tau_expr)`` if *expr* has the RL pattern, else ``None``.
+
+        Recognises two surface forms:
+
+        * ``(yinf - V("root")) / tau``
+        * ``SAFE_DIVIDE((yinf - V("root")), tau)``
+
+        Uses string search rather than regex so nested parentheses in
+        ``yinf`` or ``tau`` are handled correctly.
+        """
+        expr = expr.strip()
+        target = f'V("{root}")'
+
+        # --- Form 1: plain division ---
+        if expr.startswith("("):
+            result = _CellMLModelCompiler._extract_rl_numerator_denom_plain(expr, root, target)
+            if result is not None:
+                return result
+
+        # --- Form 2: SAFE_DIVIDE wrapper ---
+        if expr.startswith("SAFE_DIVIDE(") and expr.endswith(")"):
+            args = _CellMLModelCompiler._split_two_args(expr[len("SAFE_DIVIDE("):-1])
+            if args is not None:
+                numerator, tau_expr = args
+                numerator = numerator.strip()
+                tau_expr = tau_expr.strip()
+                # tau_expr must not reference the gate variable
+                if target not in tau_expr:
+                    yinf_expr = _CellMLModelCompiler._extract_yinf_from_numerator(numerator, root, target)
+                    if yinf_expr is not None:
+                        return yinf_expr, tau_expr
+        return None
+
+    @staticmethod
+    def _extract_yinf_from_numerator(numerator: str, root: str, target: str) -> str | None:
+        """Extract *yinf_expr* from ``(yinf - V("root"))`` (no trailing division)."""
+        numerator = numerator.strip()
+        if not numerator.startswith("(") or not numerator.endswith(")"):
+            return None
+        inner = numerator[1:-1]  # strip outer parens
+        needle = f"- {target}"
+        pos = inner.rfind(needle)
+        if pos == -1:
+            needle = f"-{target}"
+            pos = inner.rfind(needle)
+        if pos == -1:
+            return None
+        yinf_expr = inner[:pos].strip()
+        if not yinf_expr or target in yinf_expr:
+            return None
+        return yinf_expr
+
+    @staticmethod
+    def _extract_rl_numerator_denom_plain(expr: str, root: str, target: str) -> tuple[str, str] | None:
+        """Parse ``(yinf - V("root")) / tau`` from *expr*; return ``(yinf, tau)`` or ``None``."""
+        expr = expr.strip()
+        if not expr.startswith("("):
+            return None
+
+        needle = f"- {target}"
+        pos = expr.rfind(needle)
+        if pos == -1:
+            needle = f"-{target}"
+            pos = expr.rfind(needle)
+        if pos == -1:
+            return None
+
+        end_of_needle = pos + len(needle)
+        rest = expr[end_of_needle:].strip()
+        if not rest.startswith(")"):
+            return None
+        after_close = rest[1:].strip()
+        if not after_close.startswith("/"):
+            return None
+        tau_expr = after_close[1:].strip()
+
+        yinf_expr = expr[1:pos].strip()
+        if not yinf_expr or not tau_expr:
+            return None
+        if target in yinf_expr or target in tau_expr:
+            return None
+        return yinf_expr, tau_expr
+
+    @staticmethod
+    def _split_two_args(inner: str | None) -> tuple[str, str] | None:
+        """Split *inner* at the first top-level comma; return ``(arg1, arg2)`` or ``None``."""
+        if inner is None:
+            return None
+        depth = 0
+        for i, ch in enumerate(inner):
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return inner[:i].strip(), inner[i + 1 :].strip()
+        return None
 
     def _resolve_name(self, name: str, expected_kind: str | None = None) -> str:
         """Resolve a user-supplied variable name to its canonical root.
@@ -1275,12 +1398,122 @@ class _CellMLModelCompiler:
 
             return rhs
 
+        # --- Rush-Larsen stepper (NumPy) ---
+        _use_rl: bool = getattr(options, "rush_larsen", True) and bool(self.rush_larsen_gates)
+        _rl_gate_set: frozenset[str] = frozenset(self.rush_larsen_gates) if _use_rl else frozenset()
+        _rl_inf_codes: dict[str, CodeType] = dict(self.rl_inf_codes) if _use_rl else {}
+        _rl_tau_codes: dict[str, CodeType] = dict(self.rl_tau_codes) if _use_rl else {}
+
+        def _stepper_builder() -> Callable[..., Any]:
+            def step(t: float, x: np.ndarray, dt: float, args: object) -> np.ndarray:
+                """Advance state by *dt* using Rush-Larsen for gate variables.
+
+                Gate variables (those whose rate follows ``(y_inf - y) / tau``)
+                use the exact exponential update:
+                    x_new = y_inf + (x - y_inf) * exp(-dt / tau)
+                All other state variables use forward Euler.
+                """
+                params, forcing_values = CompiledModel._unpack_args(args)
+                x_arr = np.asarray(x, dtype=float)
+                if x_arr.shape != (len(state_names),):
+                    raise ShapeError(
+                        f"x must have shape {(len(state_names),)}, got {x_arr.shape}"
+                    )
+
+                forcing_arr = np.asarray(
+                    forcing_values if forcing_values is not None else (), dtype=float
+                ).reshape(-1)
+                if forcing_arr.shape[0] != len(override_targets):
+                    raise ShapeError(
+                        "forcing vector length does not match override declarations: "
+                        f"expected {len(override_targets)}, got {forcing_arr.shape[0]}"
+                    )
+
+                params = params or {}
+
+                t_float = float(t)
+                env: dict[str, float] = {"time": t_float, "t": t_float}
+                for _tr in _time_roots:
+                    env[_tr] = t_float
+                for state_index, root in enumerate(state_names):
+                    env[root] = float(x_arr[state_index])
+                for root, value in _param_initial_values.items():
+                    if root not in state_name_set:
+                        env[root] = float(value)
+                for key, value in params.items():
+                    env[_resolve_name(str(key))] = float(value)
+                for root, kind, forcing_index in override_targets:
+                    if kind in ("constant", "algebraic"):
+                        env[root] = float(forcing_arr[forcing_index])
+
+                local_env = {"V": lambda n, _g=env.get: _g(n, 0.0)}
+
+                # Evaluate all algebraics (same ordering as rhs).
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    with np.errstate(
+                        divide="ignore", invalid="ignore", over="ignore", under="ignore"
+                    ):
+                        for root in _algebraic_topo_order:
+                            if root in _forced_algebraic_roots:
+                                continue
+                            code = _algebraic_codes.get(root) or _algebraic_exprs[root]
+                            try:
+                                env[root] = float(eval(code, _GLOBAL_ENV, local_env))
+                            except Exception:
+                                env[root] = 0.0
+
+                        # Compute rates (needed for non-RL variables and overrides).
+                        rates = np.empty(len(state_names), dtype=float)
+                        for state_index, state_root in enumerate(state_names):
+                            code = _rate_codes.get(state_root) or _rate_exprs[state_root]
+                            try:
+                                rates[state_index] = float(eval(code, _GLOBAL_ENV, local_env))
+                            except Exception:
+                                rates[state_index] = 0.0
+
+                # Apply rate overrides to the rate vector before stepping.
+                for root, kind, forcing_index in override_targets:
+                    if kind == "rate":
+                        rate_index = state_names.index(root)
+                        rates[rate_index] = float(forcing_arr[forcing_index])
+                    elif kind == "rate_addend":
+                        rate_index = state_names.index(root)
+                        rates[rate_index] += float(forcing_arr[forcing_index])
+
+                dt_f = float(dt)
+                x_new = x_arr.copy()
+                for state_index, state_root in enumerate(state_names):
+                    if state_root in _rl_gate_set:
+                        yinf_code = _rl_inf_codes[state_root]
+                        tau_code = _rl_tau_codes[state_root]
+                        try:
+                            y_inf = float(eval(yinf_code, _GLOBAL_ENV, local_env))
+                            tau = max(float(eval(tau_code, _GLOBAL_ENV, local_env)), 1e-15)
+                        except Exception:
+                            # Fall back to Euler if evaluation fails.
+                            x_new[state_index] = x_arr[state_index] + dt_f * rates[state_index]
+                            continue
+                        x_new[state_index] = y_inf + (x_arr[state_index] - y_inf) * np.exp(-dt_f / tau)
+                    else:
+                        x_new[state_index] = x_arr[state_index] + dt_f * rates[state_index]
+
+                if _sanitize_nan:
+                    bad = ~np.isfinite(x_new)
+                    if np.any(bad):
+                        x_new = x_new.copy()
+                        x_new[bad] = x_arr[bad]
+                return x_new
+
+            return step
+
         return CompiledModel(
             backend="numpy",
             layout=layout,
             initial_state=self._build_initial_state(state_names),
             default_params=default_params,
             _rhs_builder=_rhs_builder,
+            _stepper_builder=_stepper_builder if _use_rl else None,
         )
 
     def _build_jax_compiled_model(self, options: object) -> "CompiledModel":
@@ -1422,12 +1655,106 @@ class _CellMLModelCompiler:
 
             return rhs
 
+        # --- Rush-Larsen stepper (JAX) ---
+        _use_rl_jax: bool = getattr(options, "rush_larsen", True) and bool(self.rush_larsen_gates)
+        _rl_gate_set_jax: frozenset[str] = frozenset(self.rush_larsen_gates) if _use_rl_jax else frozenset()
+        _rl_inf_codes_jax: dict[str, CodeType] = dict(self.rl_inf_codes) if _use_rl_jax else {}
+        _rl_tau_codes_jax: dict[str, CodeType] = dict(self.rl_tau_codes) if _use_rl_jax else {}
+
+        def _stepper_builder_jax() -> Callable[..., Any]:
+            def step(t, x, dt, args):
+                """JAX-traceable Rush-Larsen step.
+
+                Gate variables use the exact exponential update:
+                    x_new = y_inf + (x - y_inf) * exp(-dt / tau)
+                All other state variables use forward Euler.
+                Compatible with ``jax.jit`` and ``jax.lax.scan``.
+                """
+                params, forcing_values = CompiledModel._unpack_args(args)
+                x_arr = jnp.asarray(x)
+                forcing_arr = jnp.asarray(
+                    forcing_values if forcing_values is not None else (), dtype=float
+                ).reshape(-1)
+
+                params = params or {}
+
+                t_val = t
+                env: dict[str, object] = {"time": t_val, "t": t_val}
+                for _tr in _time_roots:
+                    env[_tr] = t_val
+                for state_index, root in enumerate(state_names):
+                    env[root] = x_arr[state_index]
+                for root, value in _param_initial_values.items():
+                    if root not in state_name_set:
+                        env[root] = value
+                for key, value in params.items():
+                    env[_resolve_name(str(key))] = value
+                for root, kind, forcing_index in override_targets:
+                    if kind in ("constant", "algebraic"):
+                        env[root] = forcing_arr[forcing_index]
+
+                local_env = {"V": lambda n, _g=env.get: _g(n, jnp.zeros(()))}
+
+                for root in _algebraic_topo_order:
+                    if root in _forced_algebraic_roots:
+                        continue
+                    code = _algebraic_codes.get(root) or _algebraic_exprs[root]
+                    try:
+                        env[root] = eval(code, jax_env, local_env)
+                    except Exception:
+                        env[root] = jnp.zeros(())
+
+                # Compute rates for Euler variables.
+                rate_list = []
+                for state_root in state_names:
+                    code = _rate_codes.get(state_root) or _rate_exprs[state_root]
+                    try:
+                        rate_list.append(eval(code, jax_env, local_env))
+                    except Exception:
+                        rate_list.append(jnp.zeros(()))
+                rates = jnp.stack(rate_list)
+
+                # Rate overrides applied to the rate vector.
+                for root, kind, forcing_index in override_targets:
+                    if kind == "rate":
+                        rate_index = state_names.index(root)
+                        rates = rates.at[rate_index].set(forcing_arr[forcing_index])
+                    elif kind == "rate_addend":
+                        rate_index = state_names.index(root)
+                        rates = rates.at[rate_index].add(forcing_arr[forcing_index])
+
+                # Build x_new: RL update for gates, Euler for the rest.
+                x_parts = []
+                for state_index, state_root in enumerate(state_names):
+                    xi = x_arr[state_index]
+                    if state_root in _rl_gate_set_jax:
+                        yinf_code = _rl_inf_codes_jax[state_root]
+                        tau_code = _rl_tau_codes_jax[state_root]
+                        try:
+                            y_inf = eval(yinf_code, jax_env, local_env)
+                            tau_raw = eval(tau_code, jax_env, local_env)
+                        except Exception:
+                            x_parts.append(xi + dt * rates[state_index])
+                            continue
+                        tau = jnp.maximum(tau_raw, jnp.array(1e-15))
+                        x_parts.append(y_inf + (xi - y_inf) * jnp.exp(-dt / tau))
+                    else:
+                        x_parts.append(xi + dt * rates[state_index])
+
+                x_new = jnp.stack(x_parts)
+                if _sanitize_nan:
+                    x_new = jnp.nan_to_num(x_new, nan=0.0, posinf=0.0, neginf=0.0)
+                return x_new
+
+            return step
+
         return CompiledModel(
             backend="jax",
             layout=layout,
             initial_state=self._build_initial_state(state_names),
             default_params=default_params,
             _rhs_builder=_rhs_builder,
+            _stepper_builder=_stepper_builder_jax if _use_rl_jax else None,
         )
 
     def _infer_kind(self, root: str) -> str:

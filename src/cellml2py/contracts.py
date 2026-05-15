@@ -71,6 +71,7 @@ class CompileOptions:
 
     override_targets: tuple[OverrideSpec, ...] = ()
     sanitize_nan: bool = True
+    rush_larsen: bool = True
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,9 @@ class CompiledModel:
     _rhs_builder: Callable[[], Callable[..., Any]] = field(
         repr=False
     )
+    _stepper_builder: Callable[[], Callable[..., Any]] | None = field(
+        default=None, repr=False
+    )
 
     @staticmethod
     def _unpack_args(
@@ -174,3 +178,35 @@ class CompiledModel:
         directly to ``diffrax.ODETerm(model.make_rhs())`` without wrapping.
         """
         return self._rhs_builder()
+
+    def make_stepper(self) -> Callable[..., Any]:
+        """Construct the Rush-Larsen ``step(t, x, dt, args)`` callable.
+
+        Returns a fixed-step integrator that uses the analytical exponential
+        update for detected HH-style gating variables::
+
+            x_new[i] = y_inf + (x[i] - y_inf) * exp(-dt / tau)
+
+        and forward Euler for all other state variables.  This eliminates the
+        stiffness contribution of the gating ODEs, allowing stable integration
+        with step sizes ~0.1 ms regardless of how small ``tau`` becomes.
+
+        Only available when the model was compiled from a CellML source with
+        ``CompileOptions(rush_larsen=True)`` (the default) and at least one
+        gating variable was detected.  Raises ``RuntimeError`` otherwise.
+
+        Signature of the returned callable::
+
+            step(t, x, dt, args) -> x_new
+
+        Pass it to :func:`simulate_rush_larsen` or use directly in a custom
+        integration loop.  The JAX variant is fully ``jax.jit``-compilable and
+        compatible with ``jax.lax.scan``.
+        """
+        if self._stepper_builder is None:
+            raise RuntimeError(
+                "No Rush-Larsen stepper available for this model. "
+                "Compile with backend='numpy' or backend='jax' from a CellML source "
+                "with CompileOptions(rush_larsen=True) (the default)."
+            )
+        return self._stepper_builder()

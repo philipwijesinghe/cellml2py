@@ -1,12 +1,15 @@
 """Public compile and simulation API.
 
-This module exposes three user-facing functions:
+This module exposes the user-facing functions:
 
 * :func:`compile_cellml` - compile a raw CellML 1.0 / 1.1 file via the
   built-in XML parser and MathML translator.
 * :func:`compile_opencor_python` - compile a Python file exported by the
   OpenCOR simulation environment.
 * :func:`simulate` - integrate a compiled model with ``scipy.integrate.solve_ivp``.
+* :func:`simulate_diffrax` - integrate using a diffrax solver (JAX backend).
+* :func:`simulate_rush_larsen` - fixed-step Rush-Larsen exponential integrator
+  for stiff HH-style gating variables (NumPy and JAX backends).
 
 Both compiler paths return an identical :class:`~cellml2py.contracts.CompiledModel`
 so that downstream code is agnostic to the source format.
@@ -319,3 +322,122 @@ def simulate_diffrax(
         _solve = jax.jit(_solve)
 
     return _solve(y0)
+
+
+def simulate_rush_larsen(
+    model: CompiledModel,
+    t_span: tuple[float, float],
+    *,
+    dt: float,
+    forcing: Callable[..., Any] | None = None,
+    params: dict[str, float] | None = None,
+    jit: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Integrate a CellML model with the Rush-Larsen exponential method.
+
+    HH-style gating variables detected at compile time (those whose rate
+    equation has the form ``dy/dt = (y_inf(V) - y) / tau(V)``) are advanced
+    with the exact exponential update:
+
+    .. math::
+
+        y(t + \\Delta t) = y_\\infty + (y(t) - y_\\infty)\\,
+            \\mathrm{e}^{-\\Delta t / \\tau}
+
+    All other state variables use forward Euler.  The exponential update is
+    unconditionally stable, so the step size is limited only by accuracy of the
+    non-gating dynamics (membrane voltage, ion concentrations, etc.) rather than
+    by the smallest ``tau``.
+
+    Parameters
+    ----------
+    model:
+        A :class:`~cellml2py.CompiledModel` compiled from a CellML source with
+        ``CompileOptions(rush_larsen=True)`` (the default).  The model must have
+        at least one detected gating variable; use ``model.make_stepper()`` to
+        verify before calling this function.
+    t_span:
+        ``(t0, t1)`` integration interval.
+    dt:
+        Fixed time step.  Units must match the model's time variable.
+    forcing:
+        Optional callable ``forcing(t) -> sequence`` that returns the forcing
+        vector at time *t*.  Required when the model was compiled with
+        :class:`~cellml2py.OverrideSpec` entries of kind ``"algebraic"``,
+        ``"constant"``, ``"rate"``, or ``"rate_addend"``.
+    params:
+        Optional parameter overrides ``{name: value}`` applied on every step.
+    jit:
+        If ``True`` and the model uses the JAX backend, wrap the scan loop in
+        ``jax.jit`` for compiled execution (recommended for production runs).
+        Ignored for the NumPy backend.
+
+    Returns
+    -------
+    ts : np.ndarray, shape (n_steps + 1,)
+        Time points including *t0* and *t1*.
+    ys : np.ndarray, shape (n_steps + 1, n_states)
+        State trajectories; row *i* corresponds to ``ts[i]``.
+
+    Raises
+    ------
+    RuntimeError
+        If the model has no Rush-Larsen stepper (no gating variables detected
+        or ``CompileOptions(rush_larsen=False)`` was used).
+    """
+    stepper = model.make_stepper()
+    t0, t1 = float(t_span[0]), float(t_span[1])
+
+    if model.backend == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        n_steps = max(1, int(np.ceil((t1 - t0) / dt)))
+        actual_dt = jnp.array((t1 - t0) / n_steps)
+        step_ts = jnp.linspace(t0, t1 - float(actual_dt), n_steps)
+        ts_out = jnp.linspace(t0, t1, n_steps + 1)
+        x0 = jnp.asarray(model.initial_state)
+
+        if forcing is None:
+            _args: Any = params
+
+            def _scan_body(x_carry: Any, t_step: Any) -> tuple[Any, Any]:
+                x_new = stepper(t_step, x_carry, actual_dt, _args)
+                return x_new, x_new
+
+        else:
+            _p = params
+
+            def _scan_body(x_carry: Any, t_step: Any) -> tuple[Any, Any]:
+                fv = jnp.asarray(forcing(t_step))
+                x_new = stepper(t_step, x_carry, actual_dt, (_p, fv))
+                return x_new, x_new
+
+        def _run() -> tuple[Any, Any]:
+            _x_final, _ys_steps = jax.lax.scan(_scan_body, x0, step_ts)
+            _ys = jnp.concatenate([x0[None], _ys_steps], axis=0)
+            return ts_out, _ys
+
+        if jit:
+            _run = jax.jit(_run)
+
+        ts_jax, ys_jax = _run()
+        return np.asarray(ts_jax), np.asarray(ys_jax)
+
+    else:
+        # NumPy backend: simple fixed-step loop.
+        ts_list = [t0]
+        ys_list = [model.initial_state.copy()]
+        x = model.initial_state.copy()
+        t = t0
+        while t < t1 - 1e-12 * abs(t1 - t0):
+            step_dt = min(dt, t1 - t)
+            if forcing is None:
+                _step_args: Any = params
+            else:
+                _step_args = (params, list(forcing(t)))
+            x = stepper(t, x, step_dt, _step_args)
+            t = t + step_dt
+            ts_list.append(t)
+            ys_list.append(x.copy())
+        return np.array(ts_list), np.array(ys_list)
